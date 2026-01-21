@@ -1,0 +1,19 @@
+# --- Python / Backend ---
+**/.venv/
+**/venv/
+**/env/
+**/__pycache__/
+*.pyc
+AI/test/
+
+# --- Next.js / Frontend ---
+**/node_modules/
+**/.next/
+**/out/
+**/build/
+
+# --- Secrets & Config (สำคัญมาก!) ---
+**/.env*
+**/.env.local
+.DS_Store
+Thumbs.db

@@ -1,0 +1,9 @@
+flask
+flask-cors
+transformers
+torch
+scipy
+openai
+python-dotenv
+sentence-transformers
+supabase

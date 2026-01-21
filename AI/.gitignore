@@ -1,0 +1,10 @@
+AI/.venv/
+AI/.env
+AI/__pycache__/
+AI/*.py[cod]
+AI/*.wav
+AI/index.html
+
+# ซ่อนโฟลเดอร์ test และไฟล์ทดสอบที่คุณไม่ได้ใช้ (เพื่อให้ GitHub ดูสะอาด)
+AI/test/
+AI/_*.py
