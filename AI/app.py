@@ -6,12 +6,10 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-
 from config import Config
 from llm_client import llm_client, BASE_SYSTEM_PROMPT
 from tts_engine import tts_engine
 from memory_engine import memory_engine
-from pythainlp.tokenize import sent_tokenize
 
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -87,23 +85,14 @@ async def stream_typhoon_and_tts(user_input: str, history: List[dict], user_name
                     # 1. Send text token to UI IMMEDIATELY
                     await output_queue.put({"text": token, "audio": None, "done": False})
 
-                    # 2. Check for sentence boundaries
-                    if token in [" ", "\n", "!", "?", "。", "ๆ"] or len(buffer_text) > 80:
-                        sentences = sent_tokenize(buffer_text)
-                        if len(sentences) > 1:
-                            for i in range(len(sentences) - 1):
-                                sentence_to_tts = sentences[i].strip()
-                                if sentence_to_tts:
-                                    task = asyncio.create_task(tts_worker(sentence_to_tts))
-                                    active_tts_tasks.add(task)
-                                    task.add_done_callback(active_tts_tasks.discard)
-                            buffer_text = sentences[-1]
-                        elif len(buffer_text) > 120:
-                            sentence_to_tts = buffer_text.strip()
-                            task = asyncio.create_task(tts_worker(sentence_to_tts))
+                    # 2. Simple split logic (Reverted from PyThaiNLP)
+                    if token in ["\n", "!", "?", "ๆ"] or len(buffer_text) > 100:
+                        clean_text = buffer_text.strip()
+                        if clean_text:
+                            task = asyncio.create_task(tts_worker(clean_text))
                             active_tts_tasks.add(task)
                             task.add_done_callback(active_tts_tasks.discard)
-                            buffer_text = ""
+                        buffer_text = ""
 
             if buffer_text.strip():
                 task = asyncio.create_task(tts_worker(buffer_text.strip()))
@@ -114,7 +103,7 @@ async def stream_typhoon_and_tts(user_input: str, history: List[dict], user_name
             print(f"❌ LLM Producer Error: {e}")
             await output_queue.put({"error": str(e)})
         finally:
-            # Signal LLM is finished, but we still wait for TTS tasks
+            # Signal LLM is finished
             await output_queue.put("LLM_FINISHED")
 
     async def tts_worker(text):
@@ -123,7 +112,6 @@ async def stream_typhoon_and_tts(user_input: str, history: List[dict], user_name
             audio_data = await asyncio.to_thread(tts_engine.generate_audio, text)
             if audio_data:
                 audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-                # Send ONLY the audio chunk (text was already sent)
                 await output_queue.put({"text": "", "audio": audio_base64, "done": False})
         except Exception as e:
             print(f"❌ TTS Worker Error: {e}")
@@ -139,23 +127,18 @@ async def stream_typhoon_and_tts(user_input: str, history: List[dict], user_name
         
         if item == "LLM_FINISHED":
             llm_done = True
-            # If no more active TTS tasks, we are truly done
             if not active_tts_tasks:
                 break
             continue
             
-        # If we got a real data chunk
         if isinstance(item, dict):
             yield json.dumps(item) + "\n"
         
-        # Check if we can finish (LLM done and all TTS tasks finished)
         if llm_done and not active_tts_tasks and output_queue.empty():
             break
 
-    # Final signal
     yield json.dumps({"text": "", "audio": None, "done": True}) + "\n"
 
-    # Background memory save
     final_response = "".join(full_response_text)
     if user_id:
         asyncio.create_task(memory_engine.save_message(user_id, 'user', user_input))

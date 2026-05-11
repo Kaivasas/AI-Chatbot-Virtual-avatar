@@ -17,7 +17,7 @@ class Config:
     TTS_MODEL_NAME = "VIZINTZOR/MMS-TTS-THAI-FEMALEV2"
 
     # Embedding Settings
-    EMBEDDING_MODEL_NAME = 'paraphrase-multilingual-MiniLM-L12-v2'
+    EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
 
     # App Settings
     PORT = 5500
