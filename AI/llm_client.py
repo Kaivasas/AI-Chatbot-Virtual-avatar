@@ -1,4 +1,4 @@
-from openai import OpenAI
+from openai import AsyncOpenAI
 from config import Config
 
 BASE_SYSTEM_PROMPT = (
@@ -16,7 +16,7 @@ BASE_SYSTEM_PROMPT = (
 class LLMClient:
     def __init__(self):
         if Config.TYPHOON_API_KEY:
-            self.client = OpenAI(
+            self.client = AsyncOpenAI(
                 api_key=Config.TYPHOON_API_KEY,
                 base_url=Config.TYPHOON_BASE_URL
             )
@@ -24,11 +24,11 @@ class LLMClient:
             self.client = None
             print("❌ LLM Client initialized without API Key")
 
-    def get_streaming_completion(self, messages):
+    async def get_streaming_completion(self, messages):
         if not self.client:
             return None
         
-        return self.client.chat.completions.create(
+        return await self.client.chat.completions.create(
             model=Config.LLM_MODEL,
             messages=messages,
             max_tokens=4096,
@@ -36,7 +36,7 @@ class LLMClient:
             stream=True,
         )
 
-    def summarize(self, chat_text):
+    async def summarize(self, chat_text):
         if not self.client or not chat_text:
             return None
             
@@ -50,7 +50,7 @@ class LLMClient:
         )
 
         try:
-            response = self.client.chat.completions.create(
+            response = await self.client.chat.completions.create(
                 model=Config.LLM_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=500,

@@ -1,16 +1,47 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
-from flask_cors import CORS
 import json
 import base64
+import asyncio
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+
 from config import Config
 from llm_client import llm_client, BASE_SYSTEM_PROMPT
 from tts_engine import tts_engine
 from memory_engine import memory_engine
+from pythainlp.tokenize import sent_tokenize
 
-app = Flask(__name__)
-CORS(app)
+from starlette.middleware.base import BaseHTTPMiddleware
 
-def stream_typhoon_and_tts(user_input, history, user_name, long_term_memory, user_id):
+app = FastAPI(title="Alice AI Backend")
+
+class NormalizePathMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if "//" in path:
+            new_path = path.replace("//", "/")
+            request.scope["path"] = new_path
+        return await call_next(request)
+
+# Middlewares
+app.add_middleware(NormalizePathMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    text: str
+    history: List[dict] = []
+    user_name: Optional[str] = "Unknown"
+    user_id: Optional[str] = ""
+
+async def stream_typhoon_and_tts(user_input: str, history: List[dict], user_name: str, long_term_memory: str, user_id: str):
     display_name = user_name if user_name and user_name != 'Unknown' else 'เธอ'
     rag_prompt = (
         f"{BASE_SYSTEM_PROMPT}\n\n"
@@ -31,84 +62,137 @@ def stream_typhoon_and_tts(user_input, history, user_name, long_term_memory, use
         messages.extend(history)
     messages.append({"role": "user", "content": user_input})
 
-    try:
-        stream = llm_client.get_streaming_completion(messages)
-        if not stream:
-            yield json.dumps({"error": "LLM Client Error"}) + "\n"
-            return
+    # Queue for output to client
+    output_queue = asyncio.Queue()
+    full_response_text = []
+    
+    # Track background tasks
+    active_tts_tasks = set()
 
-        full_response_text = ""
+    async def llm_producer():
+        """Handles LLM streaming and kicks off TTS tasks."""
         buffer_text = ""
-        
-        for chunk in stream:
-            token = chunk.choices[0].delta.content
-            if token:
-                buffer_text += token
-                full_response_text += token
+        try:
+            stream = await llm_client.get_streaming_completion(messages)
+            if not stream:
+                await output_queue.put({"error": "LLM Client Error"})
+                return
 
-                if token in [" ", "\n", "!", "?", "ๆ"] or len(buffer_text) > 50:
-                    clean_text = buffer_text.strip()
-                    audio_base64 = None
-                    if clean_text:
-                        audio_data = tts_engine.generate_audio(clean_text)
-                        if audio_data:
-                            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+            async for chunk in stream:
+                token = chunk.choices[0].delta.content
+                if token:
+                    buffer_text += token
+                    full_response_text.append(token)
                     
-                    yield json.dumps({
-                        "text": buffer_text,
-                        "audio": audio_base64,
-                        "done": False
-                    }) + "\n"
-                    buffer_text = ""
+                    # 1. Send text token to UI IMMEDIATELY
+                    await output_queue.put({"text": token, "audio": None, "done": False})
 
-        if buffer_text.strip():
-            audio_data = tts_engine.generate_audio(buffer_text.strip())
-            audio_base64 = base64.b64encode(audio_data).decode('utf-8') if audio_data else None
-            yield json.dumps({"text": buffer_text, "audio": audio_base64, "done": False}) + "\n"
+                    # 2. Check for sentence boundaries
+                    if token in [" ", "\n", "!", "?", "。", "ๆ"] or len(buffer_text) > 80:
+                        sentences = sent_tokenize(buffer_text)
+                        if len(sentences) > 1:
+                            for i in range(len(sentences) - 1):
+                                sentence_to_tts = sentences[i].strip()
+                                if sentence_to_tts:
+                                    task = asyncio.create_task(tts_worker(sentence_to_tts))
+                                    active_tts_tasks.add(task)
+                                    task.add_done_callback(active_tts_tasks.discard)
+                            buffer_text = sentences[-1]
+                        elif len(buffer_text) > 120:
+                            sentence_to_tts = buffer_text.strip()
+                            task = asyncio.create_task(tts_worker(sentence_to_tts))
+                            active_tts_tasks.add(task)
+                            task.add_done_callback(active_tts_tasks.discard)
+                            buffer_text = ""
 
-        yield json.dumps({"text": "", "audio": None, "done": True}) + "\n"
+            if buffer_text.strip():
+                task = asyncio.create_task(tts_worker(buffer_text.strip()))
+                active_tts_tasks.add(task)
+                task.add_done_callback(active_tts_tasks.discard)
 
-        if user_id:
-            memory_engine.save_message(user_id, 'user', user_input)
-            memory_engine.save_message(user_id, 'assistant', full_response_text)
+        except Exception as e:
+            print(f"❌ LLM Producer Error: {e}")
+            await output_queue.put({"error": str(e)})
+        finally:
+            # Signal LLM is finished, but we still wait for TTS tasks
+            await output_queue.put("LLM_FINISHED")
 
-    except Exception as e:
-        print(f"❌ Stream Error: {e}")
-        yield json.dumps({"error": str(e)}) + "\n"
+    async def tts_worker(text):
+        """Worker function to generate audio in background."""
+        try:
+            audio_data = await asyncio.to_thread(tts_engine.generate_audio, text)
+            if audio_data:
+                audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                # Send ONLY the audio chunk (text was already sent)
+                await output_queue.put({"text": "", "audio": audio_base64, "done": False})
+        except Exception as e:
+            print(f"❌ TTS Worker Error: {e}")
 
-@app.route('/api/chat/stream', methods=['POST'])
-def chat_stream_endpoint():
-    data = request.json
-    user_input = data.get('text', '')
-    history = data.get('history', [])
-    user_name = data.get('user_name', 'Unknown')
-    user_id = data.get('user_id', '')
+    # Start the LLM producer
+    producer_task = asyncio.create_task(llm_producer())
+    
+    llm_done = False
+    
+    # Consume from the output queue and yield to client
+    while True:
+        item = await output_queue.get()
+        
+        if item == "LLM_FINISHED":
+            llm_done = True
+            # If no more active TTS tasks, we are truly done
+            if not active_tts_tasks:
+                break
+            continue
+            
+        # If we got a real data chunk
+        if isinstance(item, dict):
+            yield json.dumps(item) + "\n"
+        
+        # Check if we can finish (LLM done and all TTS tasks finished)
+        if llm_done and not active_tts_tasks and output_queue.empty():
+            break
+
+    # Final signal
+    yield json.dumps({"text": "", "audio": None, "done": True}) + "\n"
+
+    # Background memory save
+    final_response = "".join(full_response_text)
+    if user_id:
+        asyncio.create_task(memory_engine.save_message(user_id, 'user', user_input))
+        asyncio.create_task(memory_engine.save_message(user_id, 'assistant', final_response))
+
+@app.post("/api/chat/stream")
+async def chat_stream_endpoint(request: ChatRequest):
+    user_input = request.text
+    history = request.history
+    user_name = request.user_name
+    user_id = request.user_id
     limited_history = history[-6:] if history else []
 
-    print(f"🌊 Streaming Chat for User ID: {user_id}")
+    print(f"🌊 Parallel Streaming Chat for User ID: {user_id}")
     
     long_term_memory = ""
     if user_id:
-        long_term_memory = memory_engine.get_relevant_memory(user_input, user_id)
+        long_term_memory = await memory_engine.get_relevant_memory(user_input, user_id)
 
-    return Response(
-        stream_with_context(stream_typhoon_and_tts(user_input, limited_history, user_name, long_term_memory, user_id)),
-        content_type='application/x-ndjson'
+    return StreamingResponse(
+        stream_typhoon_and_tts(user_input, limited_history, user_name, long_term_memory, user_id),
+        media_type="application/x-ndjson"
     )
 
-@app.route('/api/summarize', methods=['POST'])
-def summarize_endpoint():
-    data = request.json
+@app.post("/api/summarize")
+async def summarize_endpoint(request: Request):
+    data = await request.json()
     user_id = data.get('user_id')
     if not user_id:
-        return jsonify({"error": "User ID is required"}), 400
+        return {"error": "User ID is required"}
+    result = await memory_engine.process_summarization(user_id, llm_client.summarize)
+    return {"message": result}
 
-    result = memory_engine.process_summarization(user_id, llm_client.summarize)
-    return jsonify({"message": result})
-
-if __name__ == '__main__':
+if __name__ == "__main__":
+    import uvicorn
     if Config.validate():
-        print(f"🚀 Starting Flask Server at http://127.0.0.1:{Config.PORT}")
-        app.run(debug=Config.DEBUG, port=Config.PORT)
+        print(f"🚀 Starting Optimized FastAPI Server at http://127.0.0.1:{Config.PORT}")
+        uvicorn.run(app, host="0.0.0.0", port=Config.PORT)
     else:
         print("❌ Server failed to start due to missing configuration.")

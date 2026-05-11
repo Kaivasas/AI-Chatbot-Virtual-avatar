@@ -1,3 +1,4 @@
+import asyncio
 from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
 from config import Config
@@ -24,7 +25,7 @@ class MemoryEngine:
             return None
         return self.embed_model.encode(text).tolist()
 
-    def save_message(self, user_id, role, content):
+    async def save_message(self, user_id, role, content):
         if not self.supabase:
             return
         try:
@@ -35,11 +36,11 @@ class MemoryEngine:
                 "content": content,
                 "embedding": vector
             }
-            self.supabase.table("messages").insert(data).execute()
+            await asyncio.to_thread(self.supabase.table("messages").insert(data).execute)
         except Exception as e:
             print(f"❌ DB Save Error: {e}")
 
-    def get_relevant_memory(self, user_input, user_id):
+    async def get_relevant_memory(self, user_input, user_id):
         if not self.supabase or not user_id:
             return ""
         
@@ -47,20 +48,26 @@ class MemoryEngine:
             query_vector = self.get_embedding(user_input)
             
             # Search Memories
-            res_facts = self.supabase.rpc('match_memories', {
-                'query_embedding': query_vector,
-                'match_threshold': 0.35,
-                'match_count': 3,
-                'filter_user_id': user_id
-            }).execute()
+            res_facts = await asyncio.to_thread(
+                self.supabase.rpc, 'match_memories', {
+                    'query_embedding': query_vector,
+                    'match_threshold': 0.35,
+                    'match_count': 3,
+                    'filter_user_id': user_id
+                }
+            )
+            res_facts = res_facts.execute()
             
             # Search Logs
-            res_logs = self.supabase.rpc('match_messages', {
-                'query_embedding': query_vector,
-                'match_threshold': 0.35,
-                'match_count': 5,
-                'filter_user_id': user_id
-            }).execute()
+            res_logs = await asyncio.to_thread(
+                self.supabase.rpc, 'match_messages', {
+                    'query_embedding': query_vector,
+                    'match_threshold': 0.35,
+                    'match_count': 5,
+                    'filter_user_id': user_id
+                }
+            )
+            res_logs = res_logs.execute()
             
             combined_memory = []
             if res_facts.data:
@@ -79,18 +86,20 @@ class MemoryEngine:
             print(f"⚠️ Memory Retrieval Error: {e}")
             return ""
 
-    def process_summarization(self, user_id, llm_summarize_fn):
+    async def process_summarization(self, user_id, llm_summarize_fn):
         if not self.supabase:
             return "❌ Supabase not initialized"
             
         try:
-            response = self.supabase.table("messages") \
-                .select("id, role, content, created_at") \
-                .eq("user_id", user_id) \
-                .eq("is_summarized", False) \
-                .order("created_at") \
-                .limit(50) \
-                .execute()
+            response = await asyncio.to_thread(
+                lambda: self.supabase.table("messages") \
+                    .select("id, role, content, created_at") \
+                    .eq("user_id", user_id) \
+                    .eq("is_summarized", False) \
+                    .order("created_at") \
+                    .limit(50) \
+                    .execute()
+            )
                 
             messages = response.data
             if not messages:
@@ -103,7 +112,7 @@ class MemoryEngine:
                 chat_text += f"[{date_str}] {msg['role']}: {msg['content']}\n"
                 message_ids.append(msg['id'])
 
-            summary_result = llm_summarize_fn(chat_text)
+            summary_result = await llm_summarize_fn(chat_text)
             
             if summary_result:
                 vector = self.get_embedding(summary_result)
@@ -112,12 +121,14 @@ class MemoryEngine:
                     "content": summary_result,
                     "embedding": vector
                 }
-                self.supabase.table("memories").insert(data).execute()
+                await asyncio.to_thread(self.supabase.table("memories").insert(data).execute)
                 
-                self.supabase.table("messages") \
-                    .update({"is_summarized": True}) \
-                    .in_("id", message_ids) \
-                    .execute()
+                await asyncio.to_thread(
+                    lambda: self.supabase.table("messages") \
+                        .update({"is_summarized": True}) \
+                        .in_("id", message_ids) \
+                        .execute()
+                )
                     
                 return f"✅ สรุปเสร็จสิ้น: {summary_result}"
             return "❌ AI ไม่ได้ตอบกลับอะไรมา"
