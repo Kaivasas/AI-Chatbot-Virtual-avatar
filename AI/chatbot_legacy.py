@@ -109,7 +109,7 @@ def stream_typhoon_and_tts(user_input, history, user_name, long_term_memory, use
                 # 3. เช็คจุดตัดประโยค (ภาษาไทยยากตรงไม่มีจุด Fullstop)
                 # เราจะตัดเมื่อเจอ: เว้นวรรค, ขึ้นบรรทัดใหม่, หรือเครื่องหมาย ! ? 
                 # หรือถ้า Buffer ยาวเกิน 50 ตัวอักษรก็ตัดเลย (กันรอนาน)
-                if token in [" ", "\n", "!", "?", "ๆ"] or len(buffer_text) > 50:
+                if token in ["\n", "!", "?", "ๆ"] or (len(buffer_text) > 40 and token == " "):
                     
                     # ล้างข้อความให้สะอาด
                     clean_text = buffer_text.strip()
@@ -287,6 +287,8 @@ def generate_tts(text_input):
         return None
     
 def get_embedding(text):
+    if embed_model is None:
+        raise ValueError("Embedding model is not loaded")
     # encode จะคืนค่าเป็น numpy array ต้องแปลงเป็น list เพื่อลง DB
     return embed_model.encode(text).tolist()
 
@@ -351,56 +353,6 @@ app = Flask(__name__)
 CORS(app)
 
 # --- Endpoint (ส่งแค่ Text กลับไป) ---
-@app.route('/api/chat', methods=['POST'])
-def chat_endpoint():
-    data = request.json
-    user_input = data.get('text', '')
-    history = data.get('history', [])
-    user_name = data.get('user_name', 'Unknown')
-    
-    # ⚠️ เราต้องรับ User ID จาก Frontend ด้วยเพื่อใช้ค้นหาและบันทึกข้อมูล
-    user_id = data.get('user_id', '') 
-
-    print(f"🔍 กำลังค้นหาความจำเกี่ยวกับ: {user_input}")
-    
-    # 1. RAG: ไปค้น Supabase ว่าเคยคุยเรื่องนี้ไหม
-    long_term_memory = ""
-    if user_id:
-        long_term_memory = get_relevant_memory(user_input, user_id)
-        print(f"📚 เจอความจำเก่า: {long_term_memory}")
-
-    # 2. LLM: คิดคำตอบ
-    raw_response = stream_typhoon_and_tts(user_input, history, user_name, long_term_memory)
-
-    print(f"DEBUG CHECK: raw_response คือ {raw_response}")
-
-    if raw_response is None:
-        # 🔴 กรณี Error:
-        # 1. ตั้งข้อความตามที่คุณต้องการ
-        ai_response_text = "ขออภัยค่ะตอนนี้ อริส ไม่สามารถคุยด้วยได้นะคะ"
-        
-        # 2. ⛔ ไม่เรียก save_message_to_db() เลย (ทั้ง User และ Assistant จะไม่ถูกเก็บ)
-        print("⚠️ ระบบขัดข้อง: ข้ามการบันทึกลง Database")
-    else:
-        # 🟢 กรณีสำเร็จ:
-        ai_response_text = raw_response
-        
-        # ✅ บันทึกลง Database ตามปกติ
-        if user_id:
-            save_message_to_db(user_id, 'user', user_input)
-            save_message_to_db(user_id, 'assistant', ai_response_text)
-    
-    # ... (TTS และ Return เหมือนเดิม) ...
-    try:
-        audio_data = generate_tts(ai_response_text)
-        audio_base64 = base64.b64encode(audio_data).decode('utf-8') if audio_data else None
-        
-        return jsonify({
-            "response_text": ai_response_text, 
-            "audio_base64": audio_base64
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
 
 @app.route('/api/chat/stream', methods=['POST'])
 def chat_stream_endpoint():
