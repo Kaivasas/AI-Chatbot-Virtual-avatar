@@ -1,5 +1,6 @@
 import torch
 import io
+import re
 from transformers import VitsModel, AutoTokenizer
 from scipy.io.wavfile import write as write_wav
 from config import Config
@@ -20,7 +21,12 @@ class TTSEngine:
             self.model = None
 
     def generate_audio(self, text_input):
-        if not self.model:
+        if not self.model or not text_input:
+            return None
+
+        # Check if text has at least one Thai or English character
+        # To avoid "narrow(): length must be non-negative" error for punctuations only
+        if not re.search(r'[a-zA-Z\u0e01-\u0e5b]', text_input):
             return None
 
         try:

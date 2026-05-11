@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
+
 from config import Config
 from llm_client import llm_client, BASE_SYSTEM_PROMPT
 from tts_engine import tts_engine
@@ -60,89 +61,71 @@ async def stream_typhoon_and_tts(user_input: str, history: List[dict], user_name
         messages.extend(history)
     messages.append({"role": "user", "content": user_input})
 
-    # Queue for output to client
-    output_queue = asyncio.Queue()
+    # Sequence of TTS tasks to ensure correct order
+    tts_tasks = []
     full_response_text = []
-    
-    # Track background tasks
-    active_tts_tasks = set()
 
-    async def llm_producer():
-        """Handles LLM streaming and kicks off TTS tasks."""
+    try:
+        stream = await llm_client.get_streaming_completion(messages)
+        if not stream:
+            yield json.dumps({"error": "LLM Client Error"}) + "\n"
+            return
+
         buffer_text = ""
-        try:
-            stream = await llm_client.get_streaming_completion(messages)
-            if not stream:
-                await output_queue.put({"error": "LLM Client Error"})
-                return
+        
+        async for chunk in stream:
+            token = chunk.choices[0].delta.content
+            if token:
+                buffer_text += token
+                full_response_text.append(token)
 
-            async for chunk in stream:
-                token = chunk.choices[0].delta.content
-                if token:
-                    buffer_text += token
-                    full_response_text.append(token)
-                    
-                    # 1. Send text token to UI IMMEDIATELY
-                    await output_queue.put({"text": token, "audio": None, "done": False})
+                # 1. Yield text token IMMEDIATELY (with slight pacing to prevent text outrunning audio)
+                yield json.dumps({"text": token, "audio": None, "done": False}) + "\n"
+                await asyncio.sleep(0.01) # Small delay to make it feel more natural
 
-                    # 2. Simple split logic (Reverted from PyThaiNLP)
-                    if token in ["\n", "!", "?", "ๆ"] or len(buffer_text) > 100:
-                        clean_text = buffer_text.strip()
-                        if clean_text:
-                            task = asyncio.create_task(tts_worker(clean_text))
-                            active_tts_tasks.add(task)
-                            task.add_done_callback(active_tts_tasks.discard)
-                        buffer_text = ""
+                # 2. Check for sentence boundaries
+                # Thresholds: split on punctuation if buffer is long enough, OR if buffer is very long
+                if (token in ["\n", "!", "?", "ๆ", " "] and len(buffer_text) > 30) or len(buffer_text) > 100:
+                    clean_text = buffer_text.strip()
+                    if clean_text:
+                        # Create TTS task but DO NOT await it yet
+                        task = asyncio.create_task(asyncio.to_thread(tts_engine.generate_audio, clean_text))
+                        tts_tasks.append(task)
+                    buffer_text = ""
 
-            if buffer_text.strip():
-                task = asyncio.create_task(tts_worker(buffer_text.strip()))
-                active_tts_tasks.add(task)
-                task.add_done_callback(active_tts_tasks.discard)
+                # 3. Check if the oldest TTS task is done and yield its audio
+                # This ensures Sentence 1 audio ALWAYS comes before Sentence 2
+                while tts_tasks and tts_tasks[0].done():
+                    completed_task = tts_tasks.pop(0)
+                    audio_data = completed_task.result()
+                    if audio_data:
+                        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                        yield json.dumps({"text": "", "audio": audio_base64, "done": False}) + "\n"
 
-        except Exception as e:
-            print(f"❌ LLM Producer Error: {e}")
-            await output_queue.put({"error": str(e)})
-        finally:
-            # Signal LLM is finished
-            await output_queue.put("LLM_FINISHED")
+        # Final cleanup for remaining buffer
+        if buffer_text.strip():
+            task = asyncio.create_task(asyncio.to_thread(tts_engine.generate_audio, buffer_text.strip()))
+            tts_tasks.append(task)
 
-    async def tts_worker(text):
-        """Worker function to generate audio in background."""
-        try:
-            audio_data = await asyncio.to_thread(tts_engine.generate_audio, text)
+        # Wait for all remaining TTS tasks in ORDER
+        for task in tts_tasks:
+            audio_data = await task
             if audio_data:
                 audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-                await output_queue.put({"text": "", "audio": audio_base64, "done": False})
-        except Exception as e:
-            print(f"❌ TTS Worker Error: {e}")
+                yield json.dumps({"text": "", "audio": audio_base64, "done": False}) + "\n"
 
-    # Start the LLM producer
-    producer_task = asyncio.create_task(llm_producer())
-    
-    llm_done = False
-    
-    # Consume from the output queue and yield to client
-    while True:
-        item = await output_queue.get()
-        
-        if item == "LLM_FINISHED":
-            llm_done = True
-            if not active_tts_tasks:
-                break
-            continue
-            
-        if isinstance(item, dict):
-            yield json.dumps(item) + "\n"
-        
-        if llm_done and not active_tts_tasks and output_queue.empty():
-            break
+        # Final signal
+        yield json.dumps({"text": "", "audio": None, "done": True}) + "\n"
 
-    yield json.dumps({"text": "", "audio": None, "done": True}) + "\n"
+        # Background memory save
+        final_response = "".join(full_response_text)
+        if user_id:
+            asyncio.create_task(memory_engine.save_message(user_id, 'user', user_input))
+            asyncio.create_task(memory_engine.save_message(user_id, 'assistant', final_response))
 
-    final_response = "".join(full_response_text)
-    if user_id:
-        asyncio.create_task(memory_engine.save_message(user_id, 'user', user_input))
-        asyncio.create_task(memory_engine.save_message(user_id, 'assistant', final_response))
+    except Exception as e:
+        print(f"❌ Stream Error: {e}")
+        yield json.dumps({"error": str(e)}) + "\n"
 
 @app.post("/api/chat/stream")
 async def chat_stream_endpoint(request: ChatRequest):
@@ -152,7 +135,7 @@ async def chat_stream_endpoint(request: ChatRequest):
     user_id = request.user_id
     limited_history = history[-6:] if history else []
 
-    print(f"🌊 Parallel Streaming Chat for User ID: {user_id}")
+    print(f"🌊 Ordered Parallel Chat for User ID: {user_id}")
     
     long_term_memory = ""
     if user_id:
@@ -175,7 +158,7 @@ async def summarize_endpoint(request: Request):
 if __name__ == "__main__":
     import uvicorn
     if Config.validate():
-        print(f"🚀 Starting Optimized FastAPI Server at http://127.0.0.1:{Config.PORT}")
+        print(f"🚀 Starting Stabilized FastAPI Server at http://127.0.0.1:{Config.PORT}")
         uvicorn.run(app, host="0.0.0.0", port=Config.PORT)
     else:
         print("❌ Server failed to start due to missing configuration.")
