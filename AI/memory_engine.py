@@ -25,32 +25,34 @@ class MemoryEngine:
             return None
         return self.embed_model.encode(text).tolist()
 
-    async def save_message(self, user_id, role, content):
+    async def save_message(self, user_id, role, content, vector=None): # 👈 เพิ่ม vector=None
         if not self.supabase:
             return
         try:
-            vector = self.get_embedding(content)
+            # 💡 ใช้ vector ที่รับมา แต่ถ้าไม่มีค่อยแปลงใหม่
+            final_vector = vector if vector else self.get_embedding(content)
             data = {
                 "user_id": user_id,
                 "role": role,
                 "content": content,
-                "embedding": vector
+                "embedding": final_vector
             }
             await asyncio.to_thread(self.supabase.table("messages").insert(data).execute)
         except Exception as e:
             print(f"❌ DB Save Error: {e}")
 
-    async def get_relevant_memory(self, user_input, user_id):
+    async def get_relevant_memory(self, user_input, user_id, vector=None): # 👈 เพิ่ม vector=None
         if not self.supabase or not user_id:
             return ""
         
         try:
-            query_vector = self.get_embedding(user_input)
+            # 💡 ใช้ vector ที่รับมา แต่ถ้าไม่มีค่อยแปลงใหม่
+            query_vector = vector if vector else self.get_embedding(user_input)
             
             # Search Memories
             res_facts = await asyncio.to_thread(
                 self.supabase.rpc, 'match_memories', {
-                    'query_embedding': query_vector,
+                    'query_embedding': query_vector, # ใช้ query_vector ตัวเดิม
                     'match_threshold': 0.35,
                     'match_count': 3,
                     'filter_user_id': user_id
