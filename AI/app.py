@@ -120,7 +120,10 @@ async def stream_typhoon_and_tts(user_input: str, history: List[dict], user_name
         # Background memory save
         final_response = "".join(full_response_text)
         if user_id:
-            asyncio.create_task(memory_engine.save_message(user_id, 'user', user_input))
+            # 💡 ส่ง user_vector ที่แปลงไว้แล้วไปเซฟ (ไม่ต้องแปลงใหม่!)
+            asyncio.create_task(memory_engine.save_message(user_id, 'user', user_input, vector=user_vector))
+            
+            # ส่วนคำตอบของ AI ยังไงก็ต้องแปลงใหม่ 1 รอบ เพราะเราเพิ่งได้คำตอบตอนสตรีมเสร็จ
             asyncio.create_task(memory_engine.save_message(user_id, 'assistant', final_response))
 
     except Exception as e:
@@ -138,11 +141,18 @@ async def chat_stream_endpoint(request: ChatRequest):
     print(f"🌊 Ordered Parallel Chat for User ID: {user_id}")
     
     long_term_memory = ""
+    user_vector = None # 👈 เตรียมตัวแปรไว้เก็บ Vector
+    
     if user_id:
-        long_term_memory = await memory_engine.get_relevant_memory(user_input, user_id)
+        # 💡 แปลง Vector ครั้งเดียวตรงนี้ (ใช้ to_thread เพื่อไม่ให้กระบวนการแปลงไปบล็อก API)
+        user_vector = await asyncio.to_thread(memory_engine.get_embedding, user_input)
+        
+        # ส่ง Vector ไปใช้ค้นหาความทรงจำ
+        long_term_memory = await memory_engine.get_relevant_memory(user_input, user_id, vector=user_vector)
 
     return StreamingResponse(
-        stream_typhoon_and_tts(user_input, limited_history, user_name, long_term_memory, user_id),
+        # 💡 แนบ user_vector เข้าไปในฟังก์ชันสตรีมด้วย
+        stream_typhoon_and_tts(user_input, limited_history, user_name, long_term_memory, user_id, user_vector),
         media_type="application/x-ndjson"
     )
 
