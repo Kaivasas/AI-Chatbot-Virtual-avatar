@@ -40,7 +40,7 @@ class ChatRequest(BaseModel):
     user_name: Optional[str] = "Unknown"
     user_id: Optional[str] = ""
 
-async def stream_typhoon_and_tts(user_input: str, history: List[dict], user_name: str, long_term_memory: str, user_id: str):
+async def stream_typhoon_and_tts(user_input: str, history: List[dict], user_name: str, long_term_memory: str, user_id: str, user_vector: list = None):
     display_name = user_name if user_name and user_name != 'Unknown' else 'เธอ'
     rag_prompt = (
         f"{BASE_SYSTEM_PROMPT}\n\n"
